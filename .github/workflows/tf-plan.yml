@@ -1,0 +1,119 @@
+name: Terraform Plan
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: 'The project to deploy'
+        required: true
+        type: string
+      env:
+        description: 'Environment'
+        required: true
+        type: string
+      working-directory:
+        type: string
+        required: false
+        default: .terraform
+      use-task:
+        type: boolean
+        required: false
+        default: false
+    secrets:
+      aws-key:
+        required: true
+      aws-secret:
+        required: true
+
+env:
+  TF_CLI_ARGS: "-no-color"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.aws-key }}
+        aws-secret-access-key: ${{ secrets.aws-secret }}
+        aws-region: us-east-1
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+
+    - name: Install Taskfile
+      if: ${{ inputs.use-task }}
+      uses: arduino/setup-task@v1
+
+    - name: Terraform Tests All
+      id: tests
+      run: | 
+        test "${{ inputs.use-task }}" && task tf-${{ inputs.project }}-${{ inputs.env }}:tests && exit 0
+        terraform fmt -check -recursive
+        terraform init
+        terraform validate -no-color
+      continue-on-error: true
+      working-directory: ${{ inputs.working-directory }}
+
+    - name: Terraform Plan ${{ inputs.env }}
+      id: plan
+      run: |
+        test "${{ inputs.use-task }}" && task tf-${{ inputs.project }}-${{ inputs.env }}:plan && exit 0
+        terraform plan
+      continue-on-error: true
+      working-directory: ${{ inputs.working-directory }}
+
+    - name: Terraform Init
+      id: init
+      run: terraform init
+      continue-on-error: true
+      working-directory: ${{ inputs.working-directory }}
+
+    - name: Add pull request comment
+      uses: actions/github-script@v6
+      if: github.event_name == 'pull_request'
+      env:
+        PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          })
+          const title = "TF Plan ${{ inputs.project }}:${{ inputs.env }}"
+          const botComment = comments.find(comment => {
+            return comment.user.type === 'Bot' && comment.body.includes(title)
+          })
+          const output = `${title}
+          #### Terraform Tests: \`${{ steps.tests.outcome }}\` ${{ steps.tests.outcome == 'Success' && '✅' || '❌'}}
+          #### Terraform Plan: \`${{ steps.plan.outcome }}\` ${{ steps.plan.outcome == 'Success' && '✅' || '❌'}}
+          <details><summary>⏩⏩⏩ Show Plan ⏪⏪⏪</summary>\n
+          \`\`\`${process.env.PLAN}\`\`\`
+          </details>`;
+          if (botComment) {
+            github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: botComment.id,
+              body: output
+            })
+          } else {
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+          }
+    - name: Check on failures
+      if: steps.tests.outcome != 'success' || steps.plan.outcome != 'success'
+      run: |
+        echo "#### Terraform Format and Style: ${{ steps.tests.outcome == 'Success' && '✅' || '❌' }}"
+        echo "#### Terraform Plan ${{ inputs.project }}: ${{ steps.plan.outcome == 'Success' && '✅' || '❌' }}"
+        exit 1
